@@ -26,7 +26,7 @@ declare THISSCRIPT SCRIPTNAME VERSION GITROOT GITURL GITPROJ PACKAGE
 declare HOMEPATH REALUSER
 # Declare my constants/variables
 declare url
-url="https://raw.githubusercontent.com/brewpi-remix/brewpi-script-rmx/THISBRANCH/utils/doUpdate.sh"
+url="https://raw.githubusercontent.com/duncan-brown/brewpi-script-rmx/THISBRANCH/utils/doUpdate.sh"
 
 ############
 ### Init
