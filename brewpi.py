@@ -587,8 +587,23 @@ def checkBluetooth(interface=0):
 def initTilt():  # Set up Tilt
     global config
     global tilt
+
     if checkKey(config, 'tiltColor') and config['tiltColor'] != "":
-        if not checkBluetooth():
+        # Create prevTempJson for Tilt
+        if not checkKey(prevTempJson, config['tiltColor'] + 'SG'):
+            prevTempJson.update({
+                config['tiltColor'] + 'HWVer': 0,
+                config['tiltColor'] + 'SWVer': 0,
+                config['tiltColor'] + 'SG': 0,
+                config['tiltColor'] + 'Temp': 0,
+                config['tiltColor'] + 'Batt': 0
+            })
+
+        try:
+            bt = checkBluetooth()
+        except:
+            bt = False
+        if not bt:
             logError("Configured for Tilt but no Bluetooth radio available.")
         else:
             try:
@@ -598,19 +613,9 @@ def initTilt():  # Set up Tilt
 
             tilt = None
 
-            #try:
             tilt = Tilt.TiltManager(60, 10, 0)
             tilt.loadSettings()
             tilt.start()
-            # Create prevTempJson for Tilt
-            if not checkKey(prevTempJson, config['tiltColor'] + 'SG'):
-                prevTempJson.update({
-                    config['tiltColor'] + 'HWVer': 0,
-                    config['tiltColor'] + 'SWVer': 0,
-                    config['tiltColor'] + 'SG': 0,
-                    config['tiltColor'] + 'Temp': 0,
-                    config['tiltColor'] + 'Batt': 0
-                })
 
 
 def initISpindel():  # Initialize iSpindel
