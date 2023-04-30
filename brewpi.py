@@ -71,7 +71,8 @@ from backgroundserial import BackGroundSerial
 from BrewPiUtil import (Unbuffered, addSlash, logError, logMessage,
                         readCfgWithDefaults)
 
-class SerialExpected(Exception)
+class SerialExpected(Exception):
+    pass
 
 # ********************************************************************
 ####
@@ -668,7 +669,7 @@ def unixSocket(name='BEERSOCKET')
         # Set socket behavior
         newSocket.setblocking(1)  # Set socket functions to be blocking
         newSocket.listen(10)  # Create a backlog queue for up to 10 connections
-        
+
         # Timeout wait 'serialCheckInterval' seconds
         newSocket.settimeout(serialCheckInterval)
     except IOError as e:
@@ -694,11 +695,11 @@ def setSocket():  # Create a listening socket to communicate with PHP
         phpSocket.bind(
             (config.get('socketHost', 'localhost'), int(socketPort)))
         logMessage('Bound to TCP socket on port %d ' % int(socketPort))
-        
+
         # Set socket behavior
         phpSocket.setblocking(1)  # Set socket functions to be blocking
         phpSocket.listen(10)  # Create a backlog queue for up to 10 connections
-        
+
         # Timeout wait 'serialCheckInterval' seconds
         phpSocket.settimeout(serialCheckInterval)
         kittSocket = None
@@ -896,7 +897,7 @@ def loop():  # Main program loop
                     lastSocketWasKITT = False
                     phpConn, addr = phpSocket.accept()
                     phpConn.setblocking(1)
-    
+
                     # Blocking receive, times out in serialCheckInterval
                     message = phpConn.recv(4096).decode(encoding="cp437")
                     activeConn = phpConn
@@ -923,7 +924,7 @@ def loop():  # Main program loop
                     lastSocketWasKITT = True
                     kittConn, addr = kittSocket.accept()
                     kittConn.setblocking(1)
-    
+
                     # Blocking receive, times out in serialCheckInterval
                     message = kittConn.recv(4096).decode(encoding="cp437")
                     activeConn = kittConn
