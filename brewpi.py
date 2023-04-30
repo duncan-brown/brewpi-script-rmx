@@ -647,7 +647,7 @@ def renameTempKey(key):
     }
     return rename.get(key, key)
 
-def unixSocket(name='BEERSOCKET')
+def unixSocket(name='BEERSOCKET'):
     newSocket = None
     socketFile = util.scriptPath() + name
     if os.path.exists(socketFile):
