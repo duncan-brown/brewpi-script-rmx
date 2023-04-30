@@ -71,6 +71,8 @@ from backgroundserial import BackGroundSerial
 from BrewPiUtil import (Unbuffered, addSlash, logError, logMessage,
                         readCfgWithDefaults)
 
+class SerialExpected(Exception)
+
 # ********************************************************************
 ####
 # IMPORTANT NOTE:  I don't care if you play with the code, but if
@@ -148,8 +150,9 @@ prevTimeOut = 0
 prevLcdUpdate = 0
 prevSettingsUpdate = 0
 
-serialCheckInterval = 0.5  # Blocking socket functions wait in seconds
+serialCheckInterval = 0.25  # Blocking socket functions wait in seconds
 phpSocket = None  # Listening socket to communicate with PHP
+kittSocket = None # Listening socket to communicate with KITT dashboard
 serialConn = None  # Serial connection to communicate with controller
 bgSerialConn = None  # For background serial processing, put whole lines in a queue
 
@@ -643,9 +646,44 @@ def renameTempKey(key):
     }
     return rename.get(key, key)
 
+def unixSocket(name='BEERSOCKET')
+    newSocket = None
+    socketFile = util.scriptPath() + name
+    if os.path.exists(socketFile):
+        # If socket already exists, remove it
+        os.remove(socketFile)
+    newSocket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    newSocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    newSocket.bind(socketFile)  # Bind BEERSOCKET
+    # Set owner and permissions for socket
+    try:
+        fileMode = stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IWGRP  # 660
+        owner = 'brewpi'
+        group = 'www-data'
+        uid = pwd.getpwnam(owner).pw_uid
+        gid = grp.getgrnam(group).gr_gid
+        os.chown(socketFile, uid, gid)  # chown socket
+        os.chmod(socketFile, fileMode)  # chmod socket
+
+        # Set socket behavior
+        newSocket.setblocking(1)  # Set socket functions to be blocking
+        newSocket.listen(10)  # Create a backlog queue for up to 10 connections
+        
+        # Timeout wait 'serialCheckInterval' seconds
+        newSocket.settimeout(serialCheckInterval)
+    except IOError as e:
+        logError("Error({0}) while setting permissions on:".format(e.errno))
+        logError("{0}:".format(socketFile))
+        logError("{0}.".format(e.strerror))
+        logError("You are not running as root or brewpi, or your")
+        logError("permissions are not set correctly. To fix this, run:")
+        logError("sudo {0}utils/doPerms.sh".format(util.scriptPath()))
+
+    return newSocket
 
 def setSocket():  # Create a listening socket to communicate with PHP
     global phpSocket
+    global kittSocket
     global serialCheckInterval
     is_windows = sys.platform.startswith('win')
     useInetSocket = bool(config.get('useInetSocket', is_windows))
@@ -656,36 +694,17 @@ def setSocket():  # Create a listening socket to communicate with PHP
         phpSocket.bind(
             (config.get('socketHost', 'localhost'), int(socketPort)))
         logMessage('Bound to TCP socket on port %d ' % int(socketPort))
+        
+        # Set socket behavior
+        phpSocket.setblocking(1)  # Set socket functions to be blocking
+        phpSocket.listen(10)  # Create a backlog queue for up to 10 connections
+        
+        # Timeout wait 'serialCheckInterval' seconds
+        phpSocket.settimeout(serialCheckInterval)
+        kittSocket = None
     else:
-        socketFile = util.scriptPath() + 'BEERSOCKET'
-        if os.path.exists(socketFile):
-            # If socket already exists, remove it
-            os.remove(socketFile)
-        phpSocket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        phpSocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        phpSocket.bind(socketFile)  # Bind BEERSOCKET
-        # Set owner and permissions for socket
-        try:
-            fileMode = stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IWGRP  # 660
-            owner = 'brewpi'
-            group = 'www-data'
-            uid = pwd.getpwnam(owner).pw_uid
-            gid = grp.getgrnam(group).gr_gid
-            os.chown(socketFile, uid, gid)  # chown socket
-            os.chmod(socketFile, fileMode)  # chmod socket
-        except IOError as e:
-            logError("Error({0}) while setting permissions on:".format(e.errno))
-            logError("{0}:".format(socketFile))
-            logError("{0}.".format(e.strerror))
-            logError("You are not running as root or brewpi, or your")
-            logError("permissions are not set correctly. To fix this, run:")
-            logError("sudo {0}utils/doPerms.sh".format(util.scriptPath()))
-    # Set socket behavior
-    phpSocket.setblocking(1)  # Set socket functions to be blocking
-    phpSocket.listen(10)  # Create a backlog queue for up to 10 connections
-    # Timeout wait 'serialCheckInterval' seconds
-    phpSocket.settimeout(serialCheckInterval)
-
+        phpSocket = unixSocket('BEERSOCKET')
+        kittSocket = unixSocket('KITTSOCKET')
 
 def startLogs():  # Log startup messages
     global config
@@ -830,6 +849,7 @@ def loop():  # Main program loop
     global lastTiltbridge
     global timeoutTiltbridge
     global phpSocket
+    global kittSocket
     global serialConn
     global bgSerialConn
     global prevDataTime
@@ -845,6 +865,7 @@ def loop():  # Main program loop
     run = True  # Allow script loop to run
 
     try:  # Main loop
+        lastSocketWasKITT = False
         while run:
             if config['dataLogging'] == 'active':
                 # Check whether it is a new day
@@ -864,12 +885,68 @@ def loop():  # Main program loop
             # bgSerialConn receive will then process. If messages are expected
             # on serial, the timeout is raised explicitly.
 
-            try:  # Process socket messages
-                phpConn, addr = phpSocket.accept()
-                phpConn.setblocking(1)
+            activeConn = None
+            messageType = None
 
-                # Blocking receive, times out in serialCheckInterval
-                message = phpConn.recv(4096).decode(encoding="cp437")
+            # listen for a message on the phpSocket if we last heard from the
+            # KITT dash socket. alternating prevents messages on the PHP
+            # socket from endlessly blocking messages on the KITT dash socket.
+            if lastSocketWasKITT:
+                try:
+                    lastSocketWasKITT = False
+                    phpConn, addr = phpSocket.accept()
+                    phpConn.setblocking(1)
+    
+                    # Blocking receive, times out in serialCheckInterval
+                    message = phpConn.recv(4096).decode(encoding="cp437")
+                    activeConn = phpConn
+                except socket.timeout:
+                    pass
+                except ConnectionError as e:
+                    type, value, traceback = sys.exc_info()
+                    fname = os.path.split(traceback.tb_frame.f_code.co_filename)[1]
+                    logError("Caught a socket error on PHP Socket.")
+                    logError("Error info:")
+                    logError("\tError: ({0}): '{1}'".format(
+                        getattr(e, 'errno', ''), getattr(e, 'strerror', '')))
+                    logError("\tType: {0}".format(type))
+                    logError("\tFilename: {0}".format(fname))
+                    logError("\tLineNo: {0}".format(traceback.tb_lineno))
+                    logMessage("Caught a socket error, exiting.")
+                    sys.stderr.close()
+                    run = False  # This should let the loop exit gracefully
+
+            # if the phpSocket timed out or was skipped, see if there is
+            # anything from the KITT dash socket
+            if activeConn is None:
+                try:  # Process socket messages
+                    lastSocketWasKITT = True
+                    kittConn, addr = kittSocket.accept()
+                    kittConn.setblocking(1)
+    
+                    # Blocking receive, times out in serialCheckInterval
+                    message = kittConn.recv(4096).decode(encoding="cp437")
+                    activeConn = kittConn
+                except socket.timeout:
+                    pass
+                except ConnectionError as e:
+                    type, value, traceback = sys.exc_info()
+                    fname = os.path.split(traceback.tb_frame.f_code.co_filename)[1]
+                    logError("Caught a socket error on KITT Socket.")
+                    logError("Error info:")
+                    logError("\tError: ({0}): '{1}'".format(
+                        getattr(e, 'errno', ''), getattr(e, 'strerror', '')))
+                    logError("\tType: {0}".format(type))
+                    logError("\tFilename: {0}".format(fname))
+                    logError("\tLineNo: {0}".format(traceback.tb_lineno))
+                    logMessage("Caught a socket error, exiting.")
+                    sys.stderr.close()
+                    run = False  # This should let the loop exit gracefully
+
+            try:
+                if activeConn is None:
+                    # both sockets timed out so skip to serial
+                    raise SerialExpected
 
                 if "=" in message:  # Split to message/value if message has an '='
                     messageType, value = message.split("=", 1)
@@ -878,17 +955,17 @@ def loop():  # Main program loop
                     value = ""
 
                 if messageType == "ack":  # Acknowledge request
-                    phpConn.send("ack".encode(encoding="utf-8"))
+                    activeConn.send("ack".encode(encoding="utf-8"))
                 elif messageType == "lcd":  # LCD contents requested
-                    phpConn.send(json.dumps(lcdText).encode(encoding="utf-8"))
+                    activeConn.send(json.dumps(lcdText).encode(encoding="utf-8"))
                 elif messageType == "getMode":  # Echo mode setting
-                    phpConn.send(cs['mode'].encode(encoding="utf-8"))
+                    activeConn.send(cs['mode'].encode(encoding="utf-8"))
                 elif messageType == "getFridge":  # Echo fridge temperature setting
-                    phpConn.send(json.dumps(cs['fridgeSet']).encode(encoding="utf-8"))
+                    activeConn.send(json.dumps(cs['fridgeSet']).encode(encoding="utf-8"))
                 elif messageType == "getBeer":  # Echo beer temperature setting
-                    phpConn.send(json.dumps(cs['beerSet']).encode(encoding="utf-8"))
+                    activeConn.send(json.dumps(cs['beerSet']).encode(encoding="utf-8"))
                 elif messageType == "getControlConstants":  # Echo control constants
-                    phpConn.send(json.dumps(cc).encode(encoding="utf-8"))
+                    activeConn.send(json.dumps(cc).encode(encoding="utf-8"))
                 elif messageType == "getControlSettings":  # Echo control settings
                     if cs['mode'] == "p":
                         profileFile = util.scriptPath() + 'settings/tempProfile.csv'
@@ -896,24 +973,24 @@ def loop():  # Main program loop
                             cs['profile'] = prof.readline().split(
                                 ",")[-1].rstrip("\n")
                     cs['dataLogging'] = config['dataLogging']
-                    phpConn.send(json.dumps(cs).encode(encoding="utf-8"))
+                    activeConn.send(json.dumps(cs).encode(encoding="utf-8"))
                 elif messageType == "getControlVariables":  # Echo control variables
-                    phpConn.send(json.dumps(cv).encode(encoding="utf-8"))
+                    activeConn.send(json.dumps(cv).encode(encoding="utf-8"))
                 elif messageType == "refreshControlConstants":  # Request control constants from controller
                     bgSerialConn.writeln("c")
-                    raise socket.timeout
+                    raise SerialExpected
                 elif messageType == "refreshControlSettings":  # Request control settings from controller
                     bgSerialConn.writeln("s")
-                    raise socket.timeout
+                    raise SerialExpected
                 elif messageType == "refreshControlVariables":  # Request control variables from controller
                     bgSerialConn.writeln("v")
-                    raise socket.timeout
+                    raise SerialExpected
                 elif messageType == "loadDefaultControlSettings":
                     bgSerialConn.writeln("S")
-                    raise socket.timeout
+                    raise SerialExpected
                 elif messageType == "loadDefaultControlConstants":
                     bgSerialConn.writeln("C")
-                    raise socket.timeout
+                    raise SerialExpected
                 elif messageType == "setBeer":  # New constant beer temperature received
                     try:
                         newTemp = Decimal(value)
@@ -929,7 +1006,7 @@ def loop():  # Main program loop
                             "j{mode:\"b\", beerSet:" + json.dumps(cs['beerSet']) + "}")
                         logMessage("Beer temperature set to {0} degrees by web.".format(
                             str(cs['beerSet'])))
-                        raise socket.timeout  # Go to serial communication to update controller
+                        raise SerialExpected  # Go to serial communication to update controller
                     else:
                         logMessage(
                             "Beer temperature setting {0} is outside of allowed".format(str(newTemp)))
@@ -950,7 +1027,7 @@ def loop():  # Main program loop
                                            json.dumps(cs['fridgeSet']) + "}")
                         logMessage("Fridge temperature set to {0} degrees by web.".format(
                             str(cs['fridgeSet'])))
-                        raise socket.timeout  # Go to serial communication to update controller
+                        raise SerialExpected  # Go to serial communication to update controller
                     else:
                         logMessage(
                             "Fridge temperature setting {0} is outside of allowed".format(str(newTemp)))
@@ -961,7 +1038,7 @@ def loop():  # Main program loop
                     cs['mode'] = 'o'
                     bgSerialConn.writeln("j{mode:\"o\"}")
                     logMessage("Temperature control disabled.")
-                    raise socket.timeout
+                    raise SerialExpected
                 elif messageType == "setParameters": # Receive JSON key:value pairs to set parameters on the controller
                     try:
                         decoded = json.loads(value)
@@ -974,7 +1051,7 @@ def loop():  # Main program loop
                         logMessage(
                             "ERROR: Invalid JSON parameter.  String received:")
                         logMessage(value)
-                    raise socket.timeout
+                    raise SerialExpected
                 elif messageType == "stopScript":  # Exit instruction received. Stop script.
                     # Voluntary shutdown.
                     logMessage('Stop message received on socket.')
@@ -1016,16 +1093,16 @@ def loop():  # Main program loop
                 elif messageType == "startNewBrew":  # New beer name
                     newName = value
                     result = startNewBrew(newName)
-                    phpConn.send(json.dumps(result).encode(encoding="utf-8"))
+                    activeConn.send(json.dumps(result).encode(encoding="utf-8"))
                 elif messageType == "pauseLogging":  # Pause logging
                     result = pauseLogging()
-                    phpConn.send(json.dumps(result).encode(encoding="utf-8"))
+                    activeConn.send(json.dumps(result).encode(encoding="utf-8"))
                 elif messageType == "stopLogging":  # Stop logging
                     result = stopLogging()
-                    phpConn.send(json.dumps(result).encode(encoding="utf-8"))
+                    activeConn.send(json.dumps(result).encode(encoding="utf-8"))
                 elif messageType == "resumeLogging":  # Resume logging
                     result = resumeLogging()
-                    phpConn.send(json.dumps(result).encode(encoding="utf-8"))
+                    activeConn.send(json.dumps(result).encode(encoding="utf-8"))
                 elif messageType == "dateTimeFormatDisplay":  # Change date time format
                     config = util.configSet(
                         'dateTimeFormatDisplay', value, configFile)
@@ -1057,16 +1134,16 @@ def loop():  # Main program loop
                     except IOError as e:  # Catch all exceptions and report back an error
                         error = "I/O Error(%d) updating profile: %s." % (e.errno,
                                                                          e.strerror)
-                        phpConn.send(error.encode(encoding="utf-8"))
+                        activeConn.send(error.encode(encoding="utf-8"))
                         logMessage(error)
                     else:
-                        phpConn.send(
+                        activeConn.send(
                             "Profile successfully updated.".encode(encoding="utf-8"))
                         if cs['mode'] != 'p':
                             cs['mode'] = 'p'
                             bgSerialConn.writeln("j{mode:\"p\"}")
                             logMessage("Profile mode enabled.")
-                            raise socket.timeout  # Go to serial communication to update controller
+                            raise SerialExpected  # Go to serial communication to update controller
                 elif messageType == "programController" or messageType == "programArduino":  # Reprogram controller
                     if bgSerialConn is not None:
                         bgSerialConn.stop()
@@ -1111,9 +1188,9 @@ def loop():  # Main program loop
                                         shield=hwVersion.shield,
                                         deviceList=deviceList,
                                         pinList=pinList.getPinList(hwVersion.board, hwVersion.shield))
-                        phpConn.send(json.dumps(response).encode(encoding="utf-8"))
+                        activeConn.send(json.dumps(response).encode(encoding="utf-8"))
                     else:
-                        phpConn.send("device-list-not-up-to-date".encode(encoding="utf-8"))
+                        activeConn.send("device-list-not-up-to-date".encode(encoding="utf-8"))
                 elif messageType == "applyDevice":  # Change device settings
                     try:
                         # Load as JSON to check syntax
@@ -1142,13 +1219,13 @@ def loop():  # Main program loop
                         response['version'] = hwVersion.toString()
                     else:
                         response = {}
-                    phpConn.send(json.dumps(response).encode(encoding="utf-8"))
+                    activeConn.send(json.dumps(response).encode(encoding="utf-8"))
                 elif messageType == "resetController":  # Erase EEPROM
                     logMessage("Resetting controller to factory defaults.")
                     bgSerialConn.writeln("E")
                 elif messageType == "api":  # External API Received
                     # Receive an API message in JSON key:value pairs
-                    # phpConn.send("Ok".encode(encoding="utf-8"))
+                    # activeConn.send("Ok".encode(encoding="utf-8"))
                     try:
                         api = json.loads(value)
 
@@ -1471,7 +1548,7 @@ def loop():  # Main program loop
                                 statusIndex = statusIndex + 1
                     # End: iSpindel Items
 
-                    phpConn.send(json.dumps(status).encode(encoding="utf-8"))
+                    activeConn.send(json.dumps(status).encode(encoding="utf-8"))
                 else:  # Invalid message received
                     logMessage(
                         "ERROR. Received invalid message on socket: " + message)
@@ -1479,9 +1556,10 @@ def loop():  # Main program loop
                 if (time.time() - prevTimeOut) < serialCheckInterval:
                     continue
                 else:  # Raise exception to check serial for data immediately
-                    raise socket.timeout
+                    raise SerialExpected
 
-            except socket.timeout:  # Do serial communication and update settings every SerialCheckInterval
+            # nothing on the sockets, so process serial
+            except SerialExpected:
                 prevTimeOut = time.time()
 
                 if hwVersion is None:  # Do nothing if we cannot read version
@@ -1786,7 +1864,7 @@ def loop():  # Main program loop
             except ConnectionError as e:
                 type, value, traceback = sys.exc_info()
                 fname = os.path.split(traceback.tb_frame.f_code.co_filename)[1]
-                logError("Caught a socket error.")
+                logError("Caught a socket error during communication.")
                 logError("Error info:")
                 logError("\tError: ({0}): '{1}'".format(
                     getattr(e, 'errno', ''), getattr(e, 'strerror', '')))
